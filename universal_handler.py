@@ -26,18 +26,39 @@ class UniversalSQLHandler:
         self.connection = self.engine.connect()
 
     def read(self, query, params=None):
-        return pd.read_sql(text(query), self.connection, params=params)
+        with self.engine.connect() as connection:
+            result = connection.execute(text(query), params or {})
+            return result.fetchall()
+
 
     def stream_read(self, query, params=None):
-        result = self.connection.execution_options(stream_results=True).execute(text(query), params or {})
-        for row in result:
-            yield dict(row)
+        params = params or {}
+        chunk_size = params.pop("chunk_size", 10)  # Default chunk size is 100
+
+        with self.engine.connect().execution_options(stream_results=True) as conn:
+            result = conn.execute(text(query), params)
+            chunk = []
+
+            for row in result:
+                chunk.append(dict(row._mapping))
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
+
+        # yield any remaining rows
+            if chunk:
+                yield chunk
+
 
     def insert(self, table, columns, values):
         placeholders = ', '.join([f":{col}" for col in columns])
         cols = ', '.join(columns)
         query = f"INSERT INTO {table} ({cols}) VALUES ({placeholders})"
-        self.connection.execute(text(query), dict(zip(columns, values)))
+        data = dict(zip(columns, values))
+
+        with self.engine.begin() as conn:  # automatically handles transaction + commit
+            conn.execute(text(query), data)
+
 
     def bulk_upsert(self, table, columns, values_list, key_columns):
         for values in values_list:
@@ -46,7 +67,7 @@ class UniversalSQLHandler:
                 f"SELECT 1 FROM {table} WHERE " + " AND ".join([f"{k} = :{k}" for k in key_columns]),
                 key_values
             )
-            if existing.empty:
+            if not existing:
                 self.insert(table, columns, values)
             else:
                 set_cols = [col for col in columns if col not in key_columns]
